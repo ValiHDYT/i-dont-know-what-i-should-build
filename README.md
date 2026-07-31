@@ -5,7 +5,7 @@
 
 
 
-> Built in [Breadboard](https://breadboard.hackclub.com), a Hack Club program. This project took ~1.4 hours of work.
+> Built in [Breadboard](https://breadboard.hackclub.com), a Hack Club program. This project took ~2.5 hours of work.
 
 
 
@@ -40,7 +40,8 @@ The editor snapshot is in `breadboard-project.json`.
 | Part | Quantity |
 | --- | --- |
 | breadboard-full | 1 |
-| pushbutton | 5 |
+| potentiometer | 1 |
+| pushbutton | 6 |
 | ssd1306-i2c | 1 |
 
 
@@ -58,7 +59,7 @@ Build journal entries are kept in [`journals.md`](journals.md).
 
 
 
-*Made in [Breadboard](https://breadboard.hackclub.com) — 1.4h of work*
+*Made in [Breadboard](https://breadboard.hackclub.com) — 2.5h of work*
 
 
 
