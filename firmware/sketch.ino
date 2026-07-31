@@ -7,8 +7,8 @@
  *   - OK     = Play/Pause umschalten (Icon wechselt zwischen Pause und Play)
  *   - RIGHT  = nächster Song  (neuer Titel + neue ZUFALLS-Länge)
  *   - LEFT   = vorheriger Song (neuer Titel + neue ZUFALLS-Länge)
- *   - UP     = Lautstärke lauter
- *   - DOWN   = Lautstärke leiser
+ *   - Lautstärke = POTENTIOMETER an GPIO36 (drehen = lauter/leiser)
+ *   - UP/DOWN  = frei (das Poti übernimmt die Lautstärke)
  *   - Die Spielzeit läuft in Echtzeit mit, der Fortschrittsbalken füllt sich,
  *     und am Ende eines Songs springt der Player automatisch weiter.
  *
@@ -29,6 +29,13 @@
  *   LEFT  -> GPIO14
  *   RIGHT -> GPIO27
  *   OK    -> GPIO26
+ *
+ * Anschluss Potentiometer (3 Drähte):
+ *   Poti links  -> ESP32 3.3V
+ *   Poti Mitte  -> ESP32 GPIO35   (Wiper/Mittelabgriff – wird ausgelesen)
+ *   Poti rechts -> ESP32 GND
+ *   (Linksdrehung = leiser, Rechtsdrehung = lauter – je nach Verdrahtung
+ *    der Außenanschlüsse; falls es andersherum ist, äußere Drähte tauschen.)
  *
  * Benötigte Bibliotheken (Arduino IDE: Werkzeuge -> Bibliotheken verwalten):
  *   - "Adafruit SSD1306"  (Display-Treiber)
@@ -71,9 +78,14 @@ enum { IDX_UP = 0, IDX_DOWN = 1, IDX_LEFT = 2, IDX_RIGHT = 3, IDX_OK = 4 };
 
 #define DEBOUNCE_MS 50              // Entprellzeit (50 ms = Standard)
 
-// ---------- Lautstärke ------------------------------------------------------
+// ---------- Lautstärke (Potentiometer an GPIO35) ----------------------------
 #define VOLUME_MAX 30               // DFPlayer-Wertebereich: 0 (leise) bis 30 (laut)
-int volume = 15;                    // Startlautstärke (Mitte)
+#define PIN_POT    35               // Poti-Mittelabgriff -> GPIO35 (ADC1_CH7)
+#define POT_READ_MS 50              // Poti alle 50 ms neu lesen (kein Flackern)
+#define POT_HYST_RAW 60             // Hysterese: ~halbe Stufe (4096/31 ~ 132)
+int volume = 15;                    // Startlautstärke (wird vom Poti übernommen)
+unsigned long lastPotRead = 0;      // Zeitpunkt der letzten Poti-Messung
+int lastPotRaw = -10000;            // letzter akzeptierter Rohwert (Hysterese)
 
 // ---------- Simulation: Playlist & Zeiten -----------------------------------
 const char* songTitles[] = {        // Fiktive Titel zum Testen (ohne Umlaute,
@@ -115,6 +127,7 @@ void nextSong();
 void prevSong();
 void updatePlayback();
 void printTime(int sec, int x, int y);
+void updatePotVolume();
 
 // ---------- Zustand: Taster -------------------------------------------------
 // Entprell-Stati pro Taster (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=OK)
@@ -167,6 +180,7 @@ void setup()
   randomSeed(analogRead(0));
 #endif
 
+  updatePotVolume();               // Poti einmal einlesen – Anzeige stimmt sofort
   startSong();                     // ersten Song mit Zufalls-Länge laden
   drawPlayer();                    // Player-Screen anzeigen
 
@@ -181,6 +195,7 @@ void loop()
   updateButtons();                 // Taster einlesen + entprellen
   handleButtons();                 // Tastendrücke umsetzen
   updatePlayback();                // Spielzeit weiterschalten (wenn am Spielen)
+  updatePotVolume();               // Lautstärke am Poti nachführen
   delay(10);                       // kurze Pause spart CPU
 }
 
@@ -222,6 +237,41 @@ void setupButtons()
 }
 
 /* ============================================================================
+ * Potentiometer lesen und die Lautstärke daraus setzen.
+ *   - analogRead(PIN_POT) liefert auf dem ESP32 0..4095 (12 Bit)
+ *   - map() rechnet das auf den DFPlayer-Bereich 0..30 um
+ *   - 8 Messungen werden gemittelt (der ESP32-ADC rauscht etwas)
+ *   - Hysterese auf den Rohwert: erst übernehmen, wenn sich das Poti um
+ *     mind. eine halbe Stufe bewegt hat – so flackert der Balken nicht,
+ *     wenn das Poti exakt auf einer Stufengrenze stehen bleibt.
+ * ========================================================================== */
+void updatePotVolume()
+{
+  // Nicht bei jedem loop()-Durchlauf messen, sondern nur alle POT_READ_MS.
+  if (millis() - lastPotRead < POT_READ_MS) return;
+  lastPotRead = millis();
+
+  // Mehrere Messungen mitteln, um ADC-Rauschen zu glätten.
+  long sum = 0;
+  for (int i = 0; i < 8; i++) {
+    sum += analogRead(PIN_POT);
+  }
+  int raw = sum / 8;                            // 0..4095
+
+  // Hysterese: erst akzeptieren, wenn wirklich gedreht wurde.
+  if (abs(raw - lastPotRaw) <= POT_HYST_RAW) return;
+  lastPotRaw = raw;
+
+  int newVol = map(raw, 0, 4095, 0, VOLUME_MAX); // 0..30
+
+  // Nur bei echter Änderung übernehmen + neu zeichnen.
+  if (newVol != volume) {
+    volume = newVol;
+    drawPlayer();
+  }
+}
+
+/* ============================================================================
  * Tastendrücke in Aktionen umsetzen.
  * ========================================================================== */
 void handleButtons()
@@ -233,14 +283,10 @@ void handleButtons()
   }
   if (pressed[IDX_RIGHT]) { nextSong(); }  // nächster Song
   if (pressed[IDX_LEFT])  { prevSong(); }  // vorheriger Song
-  if (pressed[IDX_UP]) {                  // lauter
-    if (volume < VOLUME_MAX) volume++;
-    drawPlayer();
-  }
-  if (pressed[IDX_DOWN]) {                // leiser
-    if (volume > 0) volume--;
-    drawPlayer();
-  }
+  // Lautstärke steuert jetzt das Potentiometer (siehe updatePotVolume()).
+  // UP/DOWN sind dafür frei geworden:
+  // if (pressed[IDX_UP])   { if (volume < VOLUME_MAX) volume++; drawPlayer(); }
+  // if (pressed[IDX_DOWN]) { if (volume > 0) volume--; drawPlayer(); }
 }
 
 /* ============================================================================
@@ -329,7 +375,7 @@ void drawPlayer()
     display.fillRect(61, 46, 3, 9, SSD1306_WHITE);
     display.fillRect(66, 46, 3, 9, SSD1306_WHITE);
   } else {
-    display.drawBitmap(61, 46, icon_play_7x9, 7, 9, SSD1306_WHITE);
+    display.drawBitmap(63, 46, icon_play_7x9, 7, 9, SSD1306_WHITE);
   }
 
   // Skip-Icons (7x9): zurück links, nächster rechts vom Pause-Symbol
