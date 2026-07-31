@@ -1,8 +1,8 @@
-# I dont know what i should Build
+# ESP32 MP3 Player
 
 
 
-
+![ESP32 MP3 Player](screenshot.png)
 
 
 > Built in [Breadboard](https://breadboard.hackclub.com), a Hack Club program. This project took ~2.5 hours of work.
@@ -11,7 +11,7 @@
 
 ## What It Does
 
-Lets see what i can make
+I wanted to build a MP3 Player For a Long Time an i can Finally Build on e with Hack Club Breadboard. I am still missing some Parts in the Starter kit but it is going well.
 
 
 ## How It Works
