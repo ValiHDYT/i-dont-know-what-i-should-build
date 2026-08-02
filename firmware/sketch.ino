@@ -1,213 +1,596 @@
 /* ============================================================================
- * mp3_test.ino – MP3-Player TEST-SKETCH (Simulation ohne MP3-Modul)
+ * ESP32 MP3 Player.ino – MP3-Player mit SSD1306 OLED (128x64) + ESP32
  * ----------------------------------------------------------------------------
- * Was dieser Sketch kann:
- *   - Simuliert einen MP3-Player komplett auf dem OLED – ideal zum Testen
- *     des Layouts, BEVOR ein echtes MP3-Modul (z. B. DFPlayer Mini) da ist.
- *   - OK     = Play/Pause umschalten (Icon wechselt zwischen Pause und Play)
- *   - RIGHT  = nächster Song  (neuer Titel + neue ZUFALLS-Länge)
- *   - LEFT   = vorheriger Song (neuer Titel + neue ZUFALLS-Länge)
- *   - Lautstärke = POTENTIOMETER an GPIO36 (drehen = lauter/leiser)
- *   - UP/DOWN  = frei (das Poti übernimmt die Lautstärke)
- *   - Die Spielzeit läuft in Echtzeit mit, der Fortschrittsbalken füllt sich,
- *     und am Ende eines Songs springt der Player automatisch weiter.
+ * 6 Taster: D-Pad (UP/DOWN/LEFT/RIGHT/OK) + HOME
+ * iPod-ähnliches Menüsystem:
+ *   HOME  -> immer zum Hauptmenü
+ *   OK    -> Auswahl bestätigen / Zurück (in Unter-Screens)
+ *   UP/DOWN -> Menü-Punkt auswählen
+ *   LEFT/RIGHT -> im Player: Skip / in Settings: Lautstärke
  *
- * Anschluss Display (I2C, 4 Drähte):
- *   OLED VCC  -> ESP32 3.3V
- *   OLED GND  -> ESP32 GND
- *   OLED SDA  -> ESP32 GPIO21
- *   OLED SCL  -> ESP32 GPIO22
+ * Menü: [Player] [Songs] [Playlists] [Settings]
  *
- * Anschluss Taster (je 2 Drähte):
- *   Jeder Taster: EIN Bein -> GND, ANDERES Bein -> GPIO-Pin.
- *   (INPUT_PULLUP erledigt den Rest – keine externen Widerstände nötig!)
+ * Anschluss (I2C, 4 Drähte):
+ *   OLED VCC -> 3.3V | GND -> GND | SDA -> GPIO21 | SCL -> GPIO22
  *
- *   UP    -> GPIO13
- *   DOWN  -> GPIO12   * ACHTUNG: GPIO12 ist ein "Strapping-Pin". Falls dein
- *                     * ESP32 nach dem Anschließen nicht mehr bootet, nimm
- *                     * für DOWN einfach GPIO25 (dann hier umbenennen).
- *   LEFT  -> GPIO14
- *   RIGHT -> GPIO27
- *   OK    -> GPIO26
+ * Taster (je 2 Drähte, INPUT_PULLUP, LOW = gedrückt):
+ *   UP=13 | DOWN=12 | LEFT=14 | RIGHT=27 | OK=26
+ *   HOME=32
  *
- * Anschluss Potentiometer (3 Drähte):
- *   Poti links  -> ESP32 3.3V
- *   Poti Mitte  -> ESP32 GPIO35   (Wiper/Mittelabgriff – wird ausgelesen)
- *   Poti rechts -> ESP32 GND
- *   (Linksdrehung = leiser, Rechtsdrehung = lauter – je nach Verdrahtung
- *    der Außenanschlüsse; falls es andersherum ist, äußere Drähte tauschen.)
- *
- * Benötigte Bibliotheken (Arduino IDE: Werkzeuge -> Bibliotheken verwalten):
- *   - "Adafruit SSD1306"  (Display-Treiber)
- *   - "Adafruit GFX"      (Grafik-Bibliothek, wird automatisch mitinstalliert)
- *   - "Adafruit BusIO"    (wird automatisch mitinstalliert)
- *
- * Board-Auswahl in der Arduino IDE:
- *   Werkzeuge -> Board -> esp32 -> "ESP32 Dev Module"
+ * Potentiometer (3 Drähte):
+ *   links -> 3.3V | Mitte -> GPIO35 | rechts -> GND
  * ========================================================================== */
 
-#include <Wire.h>                  // I2C-Bibliothek (SDA/SCL)
-#include <Adafruit_GFX.h>          // Grafik: drawPixel, drawRect, drawText, ...
-#include <Adafruit_SSD1306.h>      // Der eigentliche Display-Treiber
-#include <string.h>                // strlen() für die Titel-Zentrierung
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <string.h>     // strlen()
+#include <stdio.h>      // sprintf()
+#include <stdlib.h>     // abs()
 
-// ---------- Konstanten: Display-Größe & I2C-Adresse -------------------------
-#define SCREEN_WIDTH  128          // Pixel in X-Richtung
-#define SCREEN_HEIGHT 64           // Pixel in Y-Richtung
-#define OLED_ADDR     0x3C         // Standard-Adresse der meisten SSD1306-Module
-                                   // (falls nichts angezeigt wird: 0x3D probieren)
-
-// I2C-Pins des ESP32 (Standard: SDA=21, SCL=22).
-// Wire.begin(sda, scl) setzt sie explizit – so funktioniert es auf jedem Board.
+// ---------- Display ---------------------------------------------------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR     0x3C
 #define PIN_SDA 21
 #define PIN_SCL 22
 
-// ---------- Taster-Pins (D-Pad + OK) ----------------------------------------
+// ---------- Taster-Pins (6 Taster) ------------------------------------------
 #define BTN_UP    13
 #define BTN_DOWN  12   // Strapping-Pin: bei Boot-Problemen auf 25 ändern!
 #define BTN_LEFT  14
 #define BTN_RIGHT 27
 #define BTN_OK    26
+#define BTN_HOME  32   // HOME-Taster: Immer zum Menü
 
-#define BTN_COUNT 5
-const int buttonPins[BTN_COUNT] = { BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_OK };
-
-// Indizes in den Arrays (0..4), damit wir nicht Pin-Nummern als
-// Array-Index benutzen müssen:
-enum { IDX_UP = 0, IDX_DOWN = 1, IDX_LEFT = 2, IDX_RIGHT = 3, IDX_OK = 4 };
-
-#define DEBOUNCE_MS 50              // Entprellzeit (50 ms = Standard)
-
-// ---------- Lautstärke (Potentiometer an GPIO35) ----------------------------
-#define VOLUME_MAX 30               // DFPlayer-Wertebereich: 0 (leise) bis 30 (laut)
-#define PIN_POT    35               // Poti-Mittelabgriff -> GPIO35 (ADC1_CH7)
-#define POT_READ_MS 50              // Poti alle 50 ms neu lesen (kein Flackern)
-#define POT_HYST_RAW 60             // Hysterese: ~halbe Stufe (4096/31 ~ 132)
-int volume = 15;                    // Startlautstärke (wird vom Poti übernommen)
-unsigned long lastPotRead = 0;      // Zeitpunkt der letzten Poti-Messung
-int lastPotRaw = -10000;            // letzter akzeptierter Rohwert (Hysterese)
-
-// ---------- Simulation: Playlist & Zeiten -----------------------------------
-const char* songTitles[] = {        // Fiktive Titel zum Testen (ohne Umlaute,
-  "Song 1 - Beat",                  // die Schrift kann nur ASCII-Zeichen)
-  "Mein Track", 
-  "Titel 3", 
-  "Sunset Drive",
-  "Test Nummer 5",
-  "Lopaka Rock",
-  "OLED Night",
-  "Letzter Song"
+#define BTN_COUNT 6
+const int buttonPins[BTN_COUNT] = {
+  BTN_UP, BTN_DOWN, BTN_LEFT, BTN_RIGHT, BTN_OK, BTN_HOME
 };
-const int SONG_COUNT = 8;           // Anzahl der Titel in der Liste
+enum {
+  IDX_UP = 0, IDX_DOWN = 1, IDX_LEFT = 2, IDX_RIGHT = 3,
+  IDX_OK = 4, IDX_HOME = 5
+};
 
-#define SONG_MIN_SEC 90             // kürzeste Zufalls-Länge (1:30)
-#define SONG_MAX_SEC 300            // längste Zufalls-Länge (5:00)
+#define DEBOUNCE_MS 50
 
-bool isPlaying = false;             // true = Musik läuft gerade
-int  songIndex = 0;                 // aktueller Song in der Liste
-int  totalSec   = 0;                // Gesamtlänge des Songs (Zufall)
-int  elapsedSec = 0;                // bereits abgespielte Sekunden
-unsigned long lastTick = 0;         // Zeitpunkt des letzten Sekunden-Schritts
-
-// ---------- Display-Objekt anlegen ------------------------------------------
-// -1 = kein Reset-Pin (viele Module haben nur VCC/GND/SDA/SCL).
+// ---------- Display ---------------------------------------------------------
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // ---------- Funktions-Prototypen --------------------------------------------
-// WICHTIG: Die Funktionen stehen weiter unten (nach loop()). Normalerweise
-// erzeugt die Arduino IDE diese Prototypen automatisch – das klappt aber nicht
-// immer zuverlässig. Deshalb schreiben wir sie explizit hin, damit der Sketch
-// in JEDER IDE kompiliert.
 void drawPlayer();
+void drawMenu();
+void drawSongs();
+void drawPlaylists();
+void drawSettings();
+void handleMenu();
+void handlePlayer();
+void handleSongs();
+void handlePlaylists();
+void handleSettings();
 void setupButtons();
 void updateButtons();
-void handleButtons();
-void startSong();
-void nextSong();
-void prevSong();
-void updatePlayback();
-void printTime(int sec, int x, int y);
 void updatePotVolume();
+void printTime(int sec, int x, int y);
 
 // ---------- Zustand: Taster -------------------------------------------------
-// Entprell-Stati pro Taster (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT, 4=OK)
-bool stableState[BTN_COUNT];        // aktueller stabiler Zustand (HIGH = nicht gedrückt)
-bool lastRaw[BTN_COUNT];            // letzter gelesener Rohwert
-unsigned long debounceTime[BTN_COUNT]; // Zeitpunkt der letzten Änderung
-bool pressed[BTN_COUNT];            // Flanke: TRUE nur für EINEN loop-Durchlauf
+bool stableState[BTN_COUNT];
+bool lastRaw[BTN_COUNT];
+unsigned long debounceTime[BTN_COUNT];
+bool pressed[BTN_COUNT];
 
-/* ============================================================================
- * Icons (7x9) – gleiche Skip-Icons wie im Lopaka-Layout ("Layout vom Display"),
- * plus ein Play-Dreieck, das angezeigt wird, wenn die Musik pausiert ist.
- * 1 Bit pro Pixel, MSB zuerst.
- * ========================================================================== */
-const unsigned char PROGMEM icon_next_7x9[] = {  // "nächster"
+// ---------- Lautstärke (Potentiometer an GPIO35) ----------------------------
+#define VOLUME_MAX 30
+#define PIN_POT    35
+#define POT_READ_MS 50
+#define POT_HYST_RAW 60
+int volume = 15;
+unsigned long lastPotRead = 0;
+int lastPotRaw = -10000;
+
+// ---------- Zustandsmaschine ------------------------------------------------
+#define STATE_MENU      0
+#define STATE_PLAYER    1
+#define STATE_SONGS     2
+#define STATE_PLAYLISTS 3
+#define STATE_SETTINGS  4
+
+int currentState = STATE_MENU;
+int menuPos = 0;
+
+// ---------- Menü-Items ------------------------------------------------------
+const int MENU_COUNT = 4;
+const char* menuLabels[] = { "Player", "Songs", "Playlists", "Settings" };
+const int menuTargets[] = { STATE_PLAYER, STATE_SONGS, STATE_PLAYLISTS, STATE_SETTINGS };
+
+// ---------- Songs (Platzhalter – wird durch SD-Karte ersetzt) ---------------
+const int SONG_COUNT = 0;              // 0 = keine Songs geladen
+
+// ---------- Player -----------------------------------------------------------
+bool isPlaying = false;
+int  songIndex = 0;
+int  totalSec = 0;
+int  elapsedSec = 0;
+unsigned long lastTick = 0;
+
+// ---------- Songs -----------------------------------------------------------
+int songsSel = 0;
+int songsOffset = 0;
+#define SONGS_COUNT (SONG_COUNT + 1)   // Songs + "Zurueck"
+
+// ---------- Playlists --------------------------------------------------------
+int playlistsSel = 0;
+#define PLAYLISTS_COUNT 2              // Keine Playlist + "Zurueck"
+const char* playlistLabels[] = { "No playlists yet", "Zurueck" };
+
+// ---------- Settings ---------------------------------------------------------
+int settingsSel = 0;
+#define SETTINGS_COUNT 4
+const char* settingsLabels[] = { "Volume", "Brightness", "EQ", "Zurueck" };
+
+// ---------- Menü-Icons (7x9, PROGMEM) ---------------------------------------
+const unsigned char PROGMEM icon_menu_player[] = {
+  0x00, 0x20, 0x30, 0x38, 0x3C, 0x38, 0x30, 0x20, 0x00
+};
+const unsigned char PROGMEM icon_menu_songs[] = {
+  0x00, 0x04, 0x04, 0x04, 0x7C, 0x44, 0x44, 0x7C, 0x00
+};
+const unsigned char PROGMEM icon_menu_playlists[] = {
+  0x00, 0x7E, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00
+};
+const unsigned char PROGMEM icon_menu_settings[] = {
+  0x00, 0x6C, 0x38, 0xFE, 0x38, 0x6C, 0x00, 0x00, 0x00
+};
+const unsigned char* menuIcons[] = {
+  icon_menu_player, icon_menu_songs, icon_menu_playlists, icon_menu_settings
+};
+
+// ---------- Player-Icons (7x9) ----------------------------------------------
+const unsigned char PROGMEM icon_next_7x9[] = {
   0xA0, 0xD0, 0xD8, 0xDC, 0xDE, 0xDC, 0xD8, 0xD0, 0xA0
 };
-const unsigned char PROGMEM icon_back_7x9[] = {  // "zurück"
+const unsigned char PROGMEM icon_back_7x9[] = {
   0x0A, 0x16, 0x36, 0x76, 0xF6, 0x76, 0x36, 0x16, 0x0A
 };
-const unsigned char PROGMEM icon_play_7x9[] = {  // Play-Dreieck (bei Pause)
+const unsigned char PROGMEM icon_play_7x9[] = {
   0xC0, 0xE0, 0xF0, 0xF8, 0xFC, 0xF8, 0xF0, 0xE0, 0xC0
 };
 
 /* ============================================================================
- * setup()  – läuft einmal beim Start.
+ * setup()
  * ========================================================================== */
 void setup()
 {
-  Serial.begin(115200);            // Serielle Ausgabe für Fehlermeldungen
-  delay(100);                      // Kurz warten, damit der ESP32 hochfährt
+  Serial.begin(115200);
+  delay(100);
+  Wire.begin(PIN_SDA, PIN_SCL);
 
-  Wire.begin(PIN_SDA, PIN_SCL);    // I2C starten (Pins explizit angeben!)
-
-  // Display initialisieren.
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println("SSD1306 nicht gefunden – Kabel/Adresse pruefen!");
-    while (true) {
-      delay(1000);
-    }
+    Serial.println("SSD1306 nicht gefunden!");
+    while (true) { delay(1000); }
   }
 
-  setupButtons();                  // Taster-Pins konfigurieren (INPUT_PULLUP)
-
-  // Zufallsgenerator unterschiedlich "anwerfen" (sonst immer gleiche Längen):
-  // Auf dem ESP32 gibt es dafür esp_random(); auf anderen Boards nehmen wir
-  // einen unbeschalteten Analog-Pin.
-#if defined(ESP32)
-  randomSeed(esp_random());
-#else
-  randomSeed(analogRead(0));
-#endif
-
-  updatePotVolume();               // Poti einmal einlesen – Anzeige stimmt sofort
-  startSong();                     // ersten Song mit Zufalls-Länge laden
-  drawPlayer();                    // Player-Screen anzeigen
-
-  Serial.println("MP3-Test bereit!");
+  setupButtons();
+  updatePotVolume();
+  currentState = STATE_MENU;
+  drawMenu();
+  Serial.println("ESP32 MP3 Player bereit!");
 }
 
 /* ============================================================================
- * loop() – läuft immer wieder von oben nach unten durch.
+ * loop()
  * ========================================================================== */
 void loop()
 {
-  updateButtons();                 // Taster einlesen + entprellen
-  handleButtons();                 // Tastendrücke umsetzen
-  updatePlayback();                // Spielzeit weiterschalten (wenn am Spielen)
-  updatePotVolume();               // Lautstärke am Poti nachführen
-  delay(10);                       // kurze Pause spart CPU
+  updateButtons();
+  updatePotVolume();
+
+  // HOME-Taster: Immer zum Hauptmenü
+  if (pressed[IDX_HOME]) {
+    currentState = STATE_MENU;
+    menuPos = 0;
+    songsSel = 0;
+    songsOffset = 0;
+    playlistsSel = 0;
+    settingsSel = 0;
+    drawMenu();
+    delay(10);
+    return;
+  }
+
+  switch (currentState) {
+    case STATE_MENU:      handleMenu();      break;
+    case STATE_PLAYER:    handlePlayer();    break;
+    case STATE_SONGS:     handleSongs();     break;
+    case STATE_PLAYLISTS: handlePlaylists(); break;
+    case STATE_SETTINGS:  handleSettings();  break;
+  }
+
+  delay(10);
 }
 
 /* ============================================================================
- * Taster einlesen mit Entprellung.
- * Ergebnis: pressed[i] ist nur für EINEN loop-Durchlauf TRUE (eine "Flanke").
+ * Menü-Handhabung
+ * ========================================================================== */
+void handleMenu()
+{
+  if (pressed[IDX_UP]) {
+    menuPos = (menuPos - 1 + MENU_COUNT) % MENU_COUNT;
+    drawMenu();
+  }
+  if (pressed[IDX_DOWN]) {
+    menuPos = (menuPos + 1) % MENU_COUNT;
+    drawMenu();
+  }
+  if (pressed[IDX_OK]) {
+    currentState = menuTargets[menuPos];
+    if (currentState == STATE_PLAYER) {
+      drawPlayer();
+    } else if (currentState == STATE_SONGS) {
+      songsSel = 0;
+      songsOffset = 0;
+      drawSongs();
+    } else if (currentState == STATE_PLAYLISTS) {
+      playlistsSel = 0;
+      drawPlaylists();
+    } else if (currentState == STATE_SETTINGS) {
+      settingsSel = 0;
+      drawSettings();
+    }
+  }
+}
+
+/* ============================================================================
+ * Player-Handhabung (Platzhalter – wird durch DFPlayer/SD ersetzt)
+ * ========================================================================== */
+void handlePlayer()
+{
+  if (pressed[IDX_OK]) {
+    isPlaying = !isPlaying;
+    lastTick = millis();
+    drawPlayer();
+  }
+  // LEFT/RIGHT: Skip (noch leer – wird durch MP3-Modul ersetzt)
+  if (pressed[IDX_LEFT])  { /* prevSong() */ drawPlayer(); }
+  if (pressed[IDX_RIGHT]) { /* nextSong() */ drawPlayer(); }
+  if (pressed[IDX_UP])    { if (volume < VOLUME_MAX) volume++; drawPlayer(); }
+  if (pressed[IDX_DOWN])  { if (volume > 0) volume--; drawPlayer(); }
+}
+
+/* ============================================================================
+ * Songs-Handhabung (Platzhalter)
+ * ========================================================================== */
+void handleSongs()
+{
+  if (pressed[IDX_UP]) {
+    songsSel = (songsSel - 1 + SONGS_COUNT) % SONGS_COUNT;
+    drawSongs();
+  }
+  if (pressed[IDX_DOWN]) {
+    songsSel = (songsSel + 1) % SONGS_COUNT;
+    drawSongs();
+  }
+  if (pressed[IDX_OK]) {
+    if (songsSel == SONGS_COUNT - 1) {
+      currentState = STATE_MENU;
+      drawMenu();
+    }
+  }
+}
+
+/* ============================================================================
+ * Playlists-Handhabung (Platzhalter)
+ * ========================================================================== */
+void handlePlaylists()
+{
+  if (pressed[IDX_UP]) {
+    playlistsSel = (playlistsSel - 1 + PLAYLISTS_COUNT) % PLAYLISTS_COUNT;
+    drawPlaylists();
+  }
+  if (pressed[IDX_DOWN]) {
+    playlistsSel = (playlistsSel + 1) % PLAYLISTS_COUNT;
+    drawPlaylists();
+  }
+  if (pressed[IDX_OK]) {
+    if (playlistsSel == PLAYLISTS_COUNT - 1) {
+      currentState = STATE_MENU;
+      drawMenu();
+    }
+  }
+}
+
+/* ============================================================================
+ * Settings-Handhabung
+ * ========================================================================== */
+void handleSettings()
+{
+  if (pressed[IDX_UP]) {
+    settingsSel = (settingsSel - 1 + SETTINGS_COUNT) % SETTINGS_COUNT;
+    drawSettings();
+  }
+  if (pressed[IDX_DOWN]) {
+    settingsSel = (settingsSel + 1) % SETTINGS_COUNT;
+    drawSettings();
+  }
+  if (pressed[IDX_OK]) {
+    if (settingsSel == SETTINGS_COUNT - 1) {
+      currentState = STATE_MENU;
+      drawMenu();
+    } else {
+      drawSettings();
+    }
+  }
+  if (settingsSel == 0) {
+    if (pressed[IDX_LEFT])  { if (volume > 0) volume--; drawSettings(); }
+    if (pressed[IDX_RIGHT]) { if (volume < VOLUME_MAX) volume++; drawSettings(); }
+  }
+}
+
+/* ============================================================================
+ * Zeichnen: Hauptmenü
+ * ========================================================================== */
+void drawMenu()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(34, 2);
+  display.print("MP3 Player");
+
+  display.drawLine(0, 13, 127, 13, SSD1306_WHITE);
+
+  for (int i = 0; i < MENU_COUNT; i++) {
+    int y = 17 + i * 11;
+
+    if (i == menuPos) {
+      display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+
+    display.drawBitmap(8, y, menuIcons[i], 7, 9, (i == menuPos) ? SSD1306_BLACK : SSD1306_WHITE);
+
+    display.setCursor(22, y);
+    display.print(menuLabels[i]);
+
+    if (i == menuPos) {
+      display.setCursor(118, y);
+      display.print(">");
+    }
+  }  display.setTextColor(SSD1306_WHITE);
+  display.display();
+}
+
+/* ============================================================================
+ * Zeichnen: Player-Screen
+ * ========================================================================== */
+void drawPlayer()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Titel (Platzhalter)
+  display.setCursor(34, 2);
+  display.print("No Song");
+
+  // Fortschrittsbalken (leer)
+  display.drawRect(3, 35, 120, 4, SSD1306_WHITE);
+
+  // Zeiten (leer)
+  display.setCursor(14, 47);
+  display.print("0:00");
+  display.setCursor(96, 47);
+  display.print("0:00");
+
+  // Play/Pause-Symbol
+  if (isPlaying) {
+    display.fillRect(61, 46, 3, 9, SSD1306_WHITE);
+    display.fillRect(66, 46, 3, 9, SSD1306_WHITE);
+  } else {
+    display.drawBitmap(61, 46, icon_play_7x9, 7, 9, SSD1306_WHITE);
+  }
+
+  // Skip-Icons
+  display.drawBitmap(52, 46, icon_back_7x9, 7, 9, SSD1306_WHITE);
+  display.drawBitmap(71, 46, icon_next_7x9, 7, 9, SSD1306_WHITE);
+
+  // Lautstärke-Anzeige
+  display.setCursor(8, 57);
+  display.print("VOL");
+  display.drawRect(30, 57, 32, 6, SSD1306_WHITE);
+  display.fillRect(31, 58, (volume * 30) / VOLUME_MAX, 4, SSD1306_WHITE);
+
+  display.display();
+}
+
+/* ============================================================================
+ * Zeichnen: Songs-Screen (Platzhalter)
+ * ========================================================================== */
+void drawSongs()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(34, 2);
+  display.print("Songs");
+  display.drawLine(0, 13, 127, 13, SSD1306_WHITE);
+
+  // Nur "Zurueck" anzeigen wenn keine Songs
+  if (SONG_COUNT == 0) {
+    int y = 24;
+    display.setCursor(10, y);
+    display.print("Keine Songs geladen");
+    // Zurueck
+    y = 38;
+    if (songsSel == 0) {
+      display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    }
+    display.setCursor(10, y);
+    display.print("Zurueck");
+    if (songsSel == 0) {
+      display.setCursor(118, y);
+      display.print(">");
+    }
+  } else {
+    int maxVisible = 4;
+    if (songsSel < songsOffset) songsOffset = songsSel;
+    if (songsSel >= songsOffset + maxVisible) songsOffset = songsSel - maxVisible + 1;
+
+    for (int v = 0; v < maxVisible; v++) {
+      int i = songsOffset + v;
+      if (i >= SONGS_COUNT) break;
+      int y = 16 + v * 10;
+      bool isSelected = (i == songsSel);
+
+      if (isSelected) {
+        display.fillRect(0, y - 1, 128, 10, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+      } else {
+        display.setTextColor(SSD1306_WHITE);
+      }
+
+      display.setCursor(10, y);
+      if (i < SONG_COUNT) {
+        // TODO: SD-Karten-Songliste hier einfuegen
+        display.print("Song ");
+        display.print(i + 1);
+      } else {
+        display.print("Zurueck");
+      }
+
+      if (isSelected) {
+        display.setCursor(118, y);
+        display.print(">");
+      }
+    }
+
+    display.setTextColor(SSD1306_WHITE);
+    if (songsOffset > 0) {
+      display.setCursor(120, 16);
+      display.print("^");
+    }
+    if (songsOffset + maxVisible < SONGS_COUNT) {
+      display.setCursor(120, 52);
+      display.print("v");
+    }
+  }
+
+  display.display();
+}
+
+/* ============================================================================
+ * Zeichnen: Playlists-Screen (Platzhalter)
+ * ========================================================================== */
+void drawPlaylists()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(25, 2);
+  display.print("Playlists");
+  display.drawLine(0, 13, 127, 13, SSD1306_WHITE);
+
+  for (int i = 0; i < PLAYLISTS_COUNT; i++) {
+    int y = 18 + i * 12;
+    bool isSelected = (i == playlistsSel);
+
+    if (isSelected) {
+      display.fillRect(0, y - 1, 128, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+
+    display.setCursor(10, y);
+    display.print(playlistLabels[i]);
+
+    if (isSelected) {
+      display.setCursor(118, y);
+      display.print(">");
+    }
+  }
+
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+}
+
+/* ============================================================================
+ * Zeichnen: Settings-Screen
+ * ========================================================================== */
+void drawSettings()
+{
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(28, 2);
+  display.print("Settings");
+  display.drawLine(0, 13, 127, 13, SSD1306_WHITE);
+
+  for (int i = 0; i < SETTINGS_COUNT; i++) {
+    int y = 16 + i * 10;
+
+    if (i == settingsSel) {
+      display.fillRect(0, y - 1, 128, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+
+    display.setCursor(10, y);
+    display.print(settingsLabels[i]);
+
+    if (i == 0) {
+      display.setCursor(90, y);
+      char buf[8];
+      sprintf(buf, "%d/%d", volume, VOLUME_MAX);
+      display.print(buf);
+    } else if (i == 1) {
+      display.setCursor(90, y);
+      display.print("100%");
+    } else if (i == 2) {
+      display.setCursor(90, y);
+      display.print("Normal");
+    }
+
+    if (i == settingsSel) {
+      display.setCursor(118, y);
+      display.print(">");
+    }
+  }
+
+  display.setTextColor(SSD1306_WHITE);
+  display.display();
+}
+
+/* ============================================================================
+ * Zeit als "M:SS" ausgeben
+ * ========================================================================== */
+void printTime(int sec, int x, int y)
+{
+  int m = sec / 60;
+  int s = sec % 60;
+  display.setCursor(x, y);
+  display.print(m);
+  display.print(":");
+  if (s < 10) display.print("0");
+  display.print(s);
+}
+
+/* ============================================================================
+ * Taster entprellen
  * ========================================================================== */
 void updateButtons()
 {
   for (int i = 0; i < BTN_COUNT; i++) {
-    pressed[i] = false;                            // Flanke zurücksetzen
-    bool raw = digitalRead(buttonPins[i]);         // LOW = gedrückt
+    pressed[i] = false;
+    bool raw = digitalRead(buttonPins[i]);
 
     if (raw != lastRaw[i]) {
       debounceTime[i] = millis();
@@ -218,14 +601,13 @@ void updateButtons()
       if (raw != stableState[i]) {
         stableState[i] = raw;
         if (raw == LOW) {
-          pressed[i] = true;       // nur "losgelassen -> gedrückt" zählt
+          pressed[i] = true;
         }
       }
     }
   }
 }
 
-// Konfiguriert alle Taster-Pins.
 void setupButtons()
 {
   for (int i = 0; i < BTN_COUNT; i++) {
@@ -237,167 +619,26 @@ void setupButtons()
 }
 
 /* ============================================================================
- * Potentiometer lesen und die Lautstärke daraus setzen.
- *   - analogRead(PIN_POT) liefert auf dem ESP32 0..4095 (12 Bit)
- *   - map() rechnet das auf den DFPlayer-Bereich 0..30 um
- *   - 8 Messungen werden gemittelt (der ESP32-ADC rauscht etwas)
- *   - Hysterese auf den Rohwert: erst übernehmen, wenn sich das Poti um
- *     mind. eine halbe Stufe bewegt hat – so flackert der Balken nicht,
- *     wenn das Poti exakt auf einer Stufengrenze stehen bleibt.
+ * Potentiometer lesen (8er-Mittelung + Hysterese)
  * ========================================================================== */
 void updatePotVolume()
 {
-  // Nicht bei jedem loop()-Durchlauf messen, sondern nur alle POT_READ_MS.
   if (millis() - lastPotRead < POT_READ_MS) return;
   lastPotRead = millis();
 
-  // Mehrere Messungen mitteln, um ADC-Rauschen zu glätten.
   long sum = 0;
   for (int i = 0; i < 8; i++) {
     sum += analogRead(PIN_POT);
   }
-  int raw = sum / 8;                            // 0..4095
+  int raw = sum / 8;
 
-  // Hysterese: erst akzeptieren, wenn wirklich gedreht wurde.
   if (abs(raw - lastPotRaw) <= POT_HYST_RAW) return;
   lastPotRaw = raw;
 
-  int newVol = map(raw, 0, 4095, 0, VOLUME_MAX); // 0..30
-
-  // Nur bei echter Änderung übernehmen + neu zeichnen.
+  int newVol = map(raw, 0, 4095, 0, VOLUME_MAX);
   if (newVol != volume) {
     volume = newVol;
-    drawPlayer();
+    if (currentState == STATE_PLAYER) drawPlayer();
+    if (currentState == STATE_SETTINGS) drawSettings();
   }
-}
-
-/* ============================================================================
- * Tastendrücke in Aktionen umsetzen.
- * ========================================================================== */
-void handleButtons()
-{
-  if (pressed[IDX_OK]) {                 // Play/Pause
-    isPlaying = !isPlaying;
-    lastTick = millis();                 // Zeit neu starten, damit nichts "nachspringt"
-    drawPlayer();
-  }
-  if (pressed[IDX_RIGHT]) { nextSong(); }  // nächster Song
-  if (pressed[IDX_LEFT])  { prevSong(); }  // vorheriger Song
-  // Lautstärke steuert jetzt das Potentiometer (siehe updatePotVolume()).
-  // UP/DOWN sind dafür frei geworden:
-  // if (pressed[IDX_UP])   { if (volume < VOLUME_MAX) volume++; drawPlayer(); }
-  // if (pressed[IDX_DOWN]) { if (volume > 0) volume--; drawPlayer(); }
-}
-
-/* ============================================================================
- * Spielzeit weiterschalten: jede Sekunde +1, Fortschrittsbalken füllt sich.
- * Läuft nur, wenn isPlaying == true. Am Song-Ende -> automatisch nächster.
- * ========================================================================== */
-void updatePlayback()
-{
-  if (!isPlaying) return;
-
-  unsigned long now = millis();
-  if (now - lastTick >= 1000) {
-    lastTick = now;
-    elapsedSec++;
-
-    if (elapsedSec >= totalSec) {
-      nextSong();                          // Song fertig -> automatisch weiter
-    } else {
-      drawPlayer();                        // nur neu zeichnen, wenn sich was ändert
-    }
-  }
-}
-
-/* ============================================================================
- * Song anlegen: zufällige Gesamtlänge, Zeit auf 0.
- * ========================================================================== */
-void startSong()
-{
-  totalSec   = random(SONG_MIN_SEC, SONG_MAX_SEC);
-  elapsedSec = 0;
-  lastTick   = millis();
-  drawPlayer();
-}
-
-// Springt zum nächsten Song in der Liste (mit Zufalls-Länge).
-void nextSong()
-{
-  songIndex = (songIndex + 1) % SONG_COUNT;
-  startSong();
-}
-
-// Springt zum vorherigen Song in der Liste (mit Zufalls-Länge).
-void prevSong()
-{
-  songIndex = (songIndex - 1 + SONG_COUNT) % SONG_COUNT;
-  startSong();
-}
-
-/* ============================================================================
- * Player-Screen – dein Lopaka-Layout auf dem SSD1306-OLED:
- *   Titel oben, Fortschrittsbalken, Zeiten, Play/Pause + Skip-Icons unten.
- * ========================================================================== */
-void drawPlayer()
-{
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // Titel (oben, zentriert – egal wie lang der Titel ist)
-  // 6 Pixel pro Zeichen bei Schriftgröße 1; Titel wird mittig platziert.
-  const char* title = songTitles[songIndex];
-  int titleLen = strlen(title) * 6;
-  int titleX = (SCREEN_WIDTH - titleLen) / 2;
-  if (titleX < 0) titleX = 0;              // nie links aus dem Bild raus
-  display.setCursor(titleX, 2);
-  display.print(title);
-
-  // Lautstärke-Anzeige (unten links): "VOL" + Balken
-  display.setCursor(8, 57);
-  display.print("VOL");
-  display.drawRect(30, 57, 32, 6, SSD1306_WHITE);
-  display.fillRect(31, 58, (volume * 30) / VOLUME_MAX, 4, SSD1306_WHITE);
-
-  // Fortschrittsbalken: Rahmen + Füllung (0..118 Pixel breit)
-  display.drawRect(3, 35, 120, 4, SSD1306_WHITE);
-  int progressWidth = (totalSec > 0) ? (long)elapsedSec * 118 / totalSec : 0;
-  display.fillRect(4, 36, progressWidth, 2, SSD1306_WHITE);
-
-  // Zeiten: bisherige Spielzeit (links) und Gesamtlänge (rechts)
-  printTime(elapsedSec, 14, 47);
-  printTime(totalSec, 96, 47);
-
-  // Mittleres Symbol: Pause (zwei Balken) wenn am Spielen,
-  // sonst Play-Dreieck (Pause-Zustand)
-  if (isPlaying) {
-    display.fillRect(61, 46, 3, 9, SSD1306_WHITE);
-    display.fillRect(66, 46, 3, 9, SSD1306_WHITE);
-  } else {
-    display.drawBitmap(63, 46, icon_play_7x9, 7, 9, SSD1306_WHITE);
-  }
-
-  // Skip-Icons (7x9): zurück links, nächster rechts vom Pause-Symbol
-  display.drawBitmap(52, 46, icon_back_7x9, 7, 9, SSD1306_WHITE);
-  display.drawBitmap(71, 46, icon_next_7x9, 7, 9, SSD1306_WHITE);
-
-  display.display();
-}
-
-/* ============================================================================
- * Zeit als "M:SS" ausgeben (z. B. 165 Sekunden -> "2:45").
- * ========================================================================== */
-void printTime(int sec, int x, int y)
-{
-  int m = sec / 60;
-  int s = sec % 60;
-
-  display.setCursor(x, y);
-  display.print(m);
-  display.print(":");
-  if (s < 10) {
-    display.print("0");
-  }
-  display.print(s);
 }
